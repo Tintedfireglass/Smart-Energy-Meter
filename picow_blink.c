@@ -278,8 +278,23 @@ data* calculate_energy_and_power(volatile uint16_t* buffer, size_t size) {
 // needs to send data to lcd every 0.5 seconds, update the display
 void process_adc_data(volatile uint16_t* buffer, size_t size) {
     // Process each batch of data here
-    data* entry = calculate_energy_and_power(buffer,size);
+    data* entry = calculate_energy_and_power(buffer, size);
     log_data(entry);
+
+    // Prepare the string to display on the LCD
+    char lcd_str[32];
+    snprintf(lcd_str, sizeof(lcd_str), "Pwr:%.2fW Enr:%2fWh Status:", entry->power,entry->energy);  //in front of status, add wifi connection status
+
+    // Display the string on the LCD
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print(lcd_str);
+
+    // Display the timestamp on the second line
+    char time_str[32];
+    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d I:%d V:%d", timestamp.hour, timestamp.min, timestamp.sec,entry->current,entry->voltage);
+    lcd_set_cursor(0, 1);
+    lcd_print(time_str);
 }
 
 void relay_control(bool state){
@@ -347,9 +362,10 @@ int main() {
     adc_run(true);
 
     // Start core 1
-    // multicore_launch_core1(core1_main);
+    multicore_launch_core1(core1_main);
 
     while (true) {
+        sleep_ms(1000);
         // Check if buffer 0 is ready and process it
         if (buffer_0_ready) {
             rtc_get_datetime(&timestamp);
@@ -370,9 +386,7 @@ int main() {
 
 /************TIMER ISR SECTION************/
 repeating_timer_callback_t timer_callback(repeating_timer_t *t){
-
-    write_to_flash(entry);
-    log_data(entry);
+    multicore_fifo_push_blocking(1);    
     return true;
 }
 
@@ -390,6 +404,18 @@ void core1_main(){
     }
 
     while(1){
+        uint32_t signal = multicore_fifo_pop_blocking();
+        if (signal == 1) {
+            // Log data
+            if (buffer_0_ready) {
+                process_adc_data(adc_buffer_0, BUFFER_SIZE);
+                buffer_0_ready = false;  // Reset the flag after processing
+            }
 
+            if (buffer_1_ready) {
+                process_adc_data(adc_buffer_1, BUFFER_SIZE);
+                buffer_1_ready = false;  // Reset the flag after processing
+            }
+        }
     }    
 }
