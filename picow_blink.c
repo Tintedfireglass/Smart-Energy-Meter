@@ -58,6 +58,7 @@ typedef struct {
 // Variables for webserver
 volatile data latest_readings = {0};
 critical_section_t data_critsec;
+volatile bool relay_state = false;
 
 #define ENTRIES_PER_PAGE (FLASH_PAGE_SIZE / sizeof(data)) // Calculate how many entries can fit
 
@@ -307,10 +308,14 @@ void process_adc_data(volatile uint16_t* buffer, size_t size) {
         free(entry);
     }
 }
-void relay_control(bool state){
+void relay_control(bool state) {
     gpio_put(RELAY_PIN, state);
-    if(state == true)printf("Relay state: closed");
-    else printf("Relay state: open");
+    relay_state = state;  
+    if(state == true) {
+        printf("Relay state: closed\n");
+    } else {
+        printf("Relay state: open\n");
+    }
 }
 
 /************DATALOGGING SECTION************/
@@ -349,27 +354,60 @@ void log_data(const data *entry) {
 
 /************ WEB SERVER SECTION ************/
 
+const char* relay_control_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[]) {
+    static char response[64];
+    
+    for (int i = 0; i < iNumParams; i++) {
+        if (strcmp(pcParam[i], "state") == 0) {
+            if (strcmp(pcValue[i], "on") == 0 && !relay_state) {
+                relay_control(true);
+                snprintf(response, sizeof(response), "{\"status\":\"Relay turned ON\"}");
+                return response;
+            } else if (strcmp(pcValue[i], "off") == 0 && relay_state) {
+                relay_control(false);
+                snprintf(response, sizeof(response), "{\"status\":\"Relay turned OFF\"}");
+                return response;
+            }
+        }
+    }
 
-// CGI HANDLER FUNCTION
+    // No valid state
+    snprintf(response, sizeof(response), "{\"error\":\"Invalid relay state\"}");
+    return response;
+}
+
 const char* get_readings_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[])
 {
     static char json_response[256];
     critical_section_enter_blocking(&data_critsec);
     snprintf(json_response, sizeof(json_response),
             "{\"voltage\":%d,\"current\":%d,\"power\":%lu,\"energy\":%lu,"
-            "\"timestamp\":\"%02d:%02d:%02d %02d/%02d/%d\"}",
+            "\"timestamp\":\"%02d:%02d:%02d %02d/%02d/%d\","
+            "\"relayState\":%s}",
             latest_readings.voltage, latest_readings.current,
             latest_readings.power, latest_readings.energy,
             latest_readings.hour, latest_readings.minute, latest_readings.second,
-            latest_readings.day, latest_readings.month, latest_readings.year);
+            latest_readings.day, latest_readings.month, latest_readings.year,
+            relay_state ? "true" : "false");
     critical_section_exit(&data_critsec);
     return json_response;
 }
 
+
 const tCGI cgi_handlers[] = {
     {"/readings", get_readings_cgi_handler},
+    {"/relay", relay_control_cgi_handler},  
 };
+/*
 
+How to access webserver and send/receive information
+
+http://192.168.1.100/relay?state=on
+http://192.168.1.100/relay?state=off
+http://192.168.1.100/readings
+
+
+*/
 int main() {
     stdio_init_all();
     sleep_ms(3000);  // Delay to allow USB connection time
