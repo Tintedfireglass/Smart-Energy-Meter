@@ -1,157 +1,62 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 import csv
-import time
-from datetime import datetime
-import threading
 import os
-import logging
-from logging.handlers import RotatingFileHandler
 
 app = Flask(__name__)
 
-# Configuration
-PICO_IP = "192.168.1.100"  # Pico's IP address - Check it properly everytime
-PICO_ENDPOINT = f"http://{PICO_IP}/readings"
-CSV_FOLDER = "energy_logs"
-LOG_FOLDER = "logs"
-LOGGING_INTERVAL = 5  # seconds between data points
+# Replace with your Pico's IP address
+PICO_IP = 'http://192.168.1.100'  # Update this to your Pico's IP
+CSV_FILE = 'readings.csv'
 
-# Making sure folders exist
-os.makedirs(CSV_FOLDER, exist_ok=True)
-os.makedirs(LOG_FOLDER, exist_ok=True)
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        RotatingFileHandler(
-            f'{LOG_FOLDER}/energy_logger.log',
-            maxBytes=1024*1024,  
-            backupCount=5
-        ),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-class DataLogger:
-    def __init__(self):
-        self.latest_data = None
-        self.csv_file = None
-        self.csv_writer = None
-        self.lock = threading.Lock()
-        self.initialize_csv()
-
-    def initialize_csv(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{CSV_FOLDER}/energy_data_{timestamp}.csv"
-        
-        try:
-            self.csv_file = open(filename, 'w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow([
-                'Timestamp',
-                'Voltage (V)',
-                'Current (A)',
-                'Power (W)',
-                'Energy (Wh)',
-                'Device Time'
-            ])
-            logger.info(f"Created new log file: {filename}")
-        except Exception as e:
-            logger.error(f"Failed to initialize CSV file: {e}")
-            raise
-
-    def log_data(self, data):
-        try:
-            with self.lock:
-                self.latest_data = data
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                self.csv_writer.writerow([
-                    timestamp,
-                    data['voltage'],
-                    data['current'],
-                    data['power'],
-                    data['energy'],
-                    data['timestamp']
-                ])
-                self.csv_file.flush()  # Ensure data is written to disk
-                
-            logger.debug(f"Logged data point: {data}")
-        except Exception as e:
-            logger.error(f"Failed to log data: {e}")
-
-    def close(self):
-        try:
-            if self.csv_file:
-                self.csv_file.close()
-        except Exception as e:
-            logger.error(f"Error closing CSV file: {e}")
-
-data_logger = DataLogger()
-
-def fetch_data_from_pico():
-    try:
-        response = requests.get(PICO_ENDPOINT, timeout=5)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch data: {e}")
-        return None
-
-def continuous_logging():
-    while True:
-        try:
-            data = fetch_data_from_pico()
-            if data:
-                data_logger.log_data(data)
-            else:
-                logger.warning("No data received from Pico")
-                
-        except Exception as e:
-            logger.error(f"Error in continuous logging: {e}")
-            
-        time.sleep(LOGGING_INTERVAL)
-
-# Flask routes
-@app.route('/status')
-def get_status():
-    return jsonify({
-        'status': 'running',
-        'latest_data': data_logger.latest_data,
-        'logging_interval': LOGGING_INTERVAL
-    })
-
-@app.route('/latest')
-def get_latest():
-    return jsonify(data_logger.latest_data if data_logger.latest_data else {'error': 'No data available'})
-
-@app.route('/health')
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'pico_connection': bool(data_logger.latest_data)
-    })
-
-def start_server():
-    # Start the logging thread
-    logging_thread = threading.Thread(target=continuous_logging, daemon=True)
-    logging_thread.start()
+# Function to write readings to CSV
+def save_reading_to_csv(data):
+    file_exists = os.path.isfile(CSV_FILE)
     
-    # Start the Flask server
-    app.run(host='0.0.0.0', port=5000)
+    with open(CSV_FILE, mode='a', newline='') as csvfile:
+        fieldnames = ['timestamp', 'voltage', 'current', 'power', 'energy', 'relayState']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        # Write header only if file did not exist
+        if not file_exists:
+            writer.writeheader()
+
+        # Prepare data for CSV
+        writer.writerow(data)
+
+@app.route('/relay', methods=['POST'])
+def control_relay():
+    state = request.json.get('state')
+    if state not in ['on', 'off']:
+        return jsonify({'error': 'Invalid state. Use "on" or "off".'}), 400
+
+    # Send request to Pico to change relay state
+    response = requests.get(f"{PICO_IP}/relay?state={state}")
+    
+    if response.ok:
+        return jsonify(response.json())
+    else:
+        return jsonify({'error': 'Failed to control relay.'}), 500
+
+@app.route('/readings', methods=['GET'])
+def get_readings():
+    # Send request to Pico to get readings
+    response = requests.get(f"{PICO_IP}/readings")
+
+    if response.ok:
+        data = response.json()
+        
+        # Create a combined timestamp string
+        timestamp = f"{data['timestamp']['hour']:02}:{data['timestamp']['minute']:02}:{data['timestamp']['second']:02} " \
+                    f"{data['timestamp']['day']:02}/{data['timestamp']['month']:02}/{data['timestamp']['year']}"
+        
+        # Add the formatted timestamp to the data dictionary
+        data['timestamp'] = timestamp
+
+        save_reading_to_csv(data)  # Save the readings to CSV
+        return jsonify(data)
+    else:
+        return jsonify({'error': 'Failed to retrieve readings.'}), 500
 
 if __name__ == '__main__':
-    try:
-        logger.info("Starting Energy Data Logger")
-        start_server()
-    except KeyboardInterrupt:
-        logger.info("Shutting down Energy Data Logger")
-        data_logger.close()
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        data_logger.close()
+    app.run(host='0.0.0.0', port=5000)
