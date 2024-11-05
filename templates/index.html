@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Power Monitoring Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.7.0/chart.min.js"></script>
+    <style>
+        /* CSS styling */
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 20px;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+        .switch input {
+            display: none;
+        }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+        input:checked + .slider {
+            background-color: #2196F3;
+        }
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+        .readings {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        .reading-card {
+            padding: 15px;
+            text-align: center;
+            font-size: 24px;
+            color: #2196F3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <h2>Power Monitoring Dashboard</h2>
+            <div>
+                <label class="switch">
+                    <input type="checkbox" id="relayToggle">
+                    <span class="slider"></span>
+                </label>
+                <span>Relay Control</span>
+            </div>
+        </div>
+        <div class="readings">
+            <div class="reading-card" id="voltageReading">Voltage (V): 0</div>
+            <div class="reading-card" id="currentReading">Current (A): 0</div>
+            <div class="reading-card" id="powerReading">Power (W): 0</div>
+            <div class="reading-card" id="energyReading">Energy (Ws): 0</div>
+        </div>
+        <canvas id="powerChart"></canvas>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('powerChart').getContext('2d');
+        const powerChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{ label: 'Power (W)', data: [], borderColor: '#2196F3' }]
+            },
+            options: { responsive: true, scales: { y: { beginAtZero: true } } }
+        });
+
+        document.getElementById('relayToggle').addEventListener('change', async function(e) {
+            const state = e.target.checked ? 'on' : 'off';
+            await fetch('/relay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state }) });
+        });
+
+        async function updateReadings() {
+            const response = await fetch('/readings');
+            if (response.ok) {
+                const data = await response.json();
+                document.getElementById('voltageReading').textContent = `Voltage (V): ${data.voltage.toFixed(1)}`;
+                document.getElementById('currentReading').textContent = `Current (A): ${data.current.toFixed(2)}`;
+                document.getElementById('powerReading').textContent = `Power (W): ${data.power.toFixed(1)}`;
+                document.getElementById('energyReading').textContent = `Energy (Wh): ${data.energy.toFixed(1)}`;
+
+                powerChart.data.labels.push(data.timestamp);
+                powerChart.data.datasets[0].data.push(data.power);
+                if (powerChart.data.labels.length > 50) { powerChart.data.labels.shift(); powerChart.data.datasets[0].data.shift(); }
+                powerChart.update();
+            }
+        }
+        setInterval(updateReadings, 5000);
+    </script>
+</body>
+</html>
