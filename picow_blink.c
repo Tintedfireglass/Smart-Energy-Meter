@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include "hardware/adc.h"
 #include "hardware/dma.h"
-#include "pico/multicore.h"
 #include "hardware/irq.h"
 #include "hardware/i2c.h"
 #include "hardware/timer.h"
@@ -11,6 +10,9 @@
 #include "time.h"
 #include "hardware/flash.h"
 #include "string.h"
+#include "lwip/apps/httpd.h"
+#include "lwip/tcp.h"
+#include "lwip/init.h"
 
 // wifi credentials
 const char WIFI_SSID[] = "Verma C1";
@@ -37,12 +39,10 @@ const char WIFI_PASS[] = "Vasuch3tan";
 #define I2C_SDA 16
 
 // Flash definitions
-#define FLASH_TARGET_OFFSET (1 * 1024 * 1024) // Address at 1MB (after program space)
-//  FLASH_PAGE_SIZE 256
-//  FLASH_SECTOR_SIZE 4096
+#define FLASH_TARGET_OFFSET (1 * 1024 * 1024)
 
 // Datalogging Struct
-typedef struct{
+typedef struct {
     uint8_t day;
     uint8_t month;
     uint16_t year;
@@ -54,6 +54,11 @@ typedef struct{
     uint32_t power;
     uint32_t energy;
 }data;
+
+// Variables for webserver
+volatile data latest_readings = {0};
+critical_section_t data_critsec;
+volatile bool relay_state = false;
 
 #define ENTRIES_PER_PAGE (FLASH_PAGE_SIZE / sizeof(data)) // Calculate how many entries can fit
 
@@ -277,30 +282,40 @@ data* calculate_energy_and_power(volatile uint16_t* buffer, size_t size) {
 
 // needs to send data to lcd every 0.5 seconds, update the display
 void process_adc_data(volatile uint16_t* buffer, size_t size) {
-    // Process each batch of data here
     data* entry = calculate_energy_and_power(buffer, size);
-    log_data(entry);
+    if (entry != NULL) {
+        // Update LCD display
+        char lcd_str[32];
+        snprintf(lcd_str, sizeof(lcd_str), "Pwr:%.2fW Enr:%.2fWh", 
+                (float)entry->power, (float)entry->energy);
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print(lcd_str);
 
-    // Prepare the string to display on the LCD
-    char lcd_str[32];
-    snprintf(lcd_str, sizeof(lcd_str), "Pwr:%.2fW Enr:%2fWh Status:", entry->power,entry->energy);  //in front of status, add wifi connection status
+        // Display timestamp
+        char time_str[32];
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d I:%d V:%d", 
+                timestamp.hour, timestamp.min, timestamp.sec,
+                entry->current, entry->voltage);
+        lcd_set_cursor(0, 1);
+        lcd_print(time_str);
 
-    // Display the string on the LCD
-    lcd_clear();
-    lcd_set_cursor(0, 0);
-    lcd_print(lcd_str);
-
-    // Display the timestamp on the second line
-    char time_str[32];
-    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d I:%d V:%d", timestamp.hour, timestamp.min, timestamp.sec,entry->current,entry->voltage);
-    lcd_set_cursor(0, 1);
-    lcd_print(time_str);
+        // Send data to Core 1 for web server
+        multicore_fifo_push_blocking((uint32_t)entry);
+        
+        // Log data to flash
+        log_data(entry);
+        free(entry);
+    }
 }
-
-void relay_control(bool state){
+void relay_control(bool state) {
     gpio_put(RELAY_PIN, state);
-    if(state == true)printf("Relay state: closed");
-    else printf("Relay state: open");
+    relay_state = state;  
+    if(state == true) {
+        printf("Relay state: closed\n");
+    } else {
+        printf("Relay state: open\n");
+    }
 }
 
 /************DATALOGGING SECTION************/
@@ -336,6 +351,63 @@ void log_data(const data *entry) {
 //     // }
 // }
 
+
+/************ WEB SERVER SECTION ************/
+
+const char* relay_control_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[]) {
+    static char response[64];
+    
+    for (int i = 0; i < iNumParams; i++) {
+        if (strcmp(pcParam[i], "state") == 0) {
+            if (strcmp(pcValue[i], "on") == 0 && !relay_state) {
+                relay_control(true);
+                snprintf(response, sizeof(response), "{\"status\":\"Relay turned ON\"}");
+                return response;
+            } else if (strcmp(pcValue[i], "off") == 0 && relay_state) {
+                relay_control(false);
+                snprintf(response, sizeof(response), "{\"status\":\"Relay turned OFF\"}");
+                return response;
+            }
+        }
+    }
+
+    // No valid state
+    snprintf(response, sizeof(response), "{\"error\":\"Invalid relay state\"}");
+    return response;
+}
+
+const char* get_readings_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[])
+{
+    static char json_response[256];
+    critical_section_enter_blocking(&data_critsec);
+    snprintf(json_response, sizeof(json_response),
+            "{\"voltage\":%d,\"current\":%d,\"power\":%lu,\"energy\":%lu,"
+            "\"timestamp\":\"%02d:%02d:%02d %02d/%02d/%d\","
+            "\"relayState\":%s}",
+            latest_readings.voltage, latest_readings.current,
+            latest_readings.power, latest_readings.energy,
+            latest_readings.hour, latest_readings.minute, latest_readings.second,
+            latest_readings.day, latest_readings.month, latest_readings.year,
+            relay_state ? "true" : "false");
+    critical_section_exit(&data_critsec);
+    return json_response;
+}
+
+
+const tCGI cgi_handlers[] = {
+    {"/readings", get_readings_cgi_handler},
+    {"/relay", relay_control_cgi_handler},  
+};
+/*
+
+How to access webserver and send/receive information
+
+http://192.168.1.100/relay?state=on
+http://192.168.1.100/relay?state=off
+http://192.168.1.100/readings
+
+
+*/
 int main() {
     stdio_init_all();
     sleep_ms(3000);  // Delay to allow USB connection time
@@ -390,32 +462,43 @@ repeating_timer_callback_t timer_callback(repeating_timer_t *t){
     return true;
 }
 
-void core1_main(){
-    if (cyw43_arch_init()){
-        printf("Wi-Fi init failed");
-    }
+void core1_main() {
+    
+    critical_section_init(&data_critsec);
 
-    add_repeating_timer_ms(60000,timer_callback,NULL,&timer_one_minute);
+    // Initialize WiFi
+    if (cyw43_arch_init()) {
+        printf("WiFi init failed\n");
+        return;
+    }
 
     cyw43_arch_enable_sta_mode();
 
-    while (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000) != 0){
-        printf("Wi-Fi connection failed");
+    // Connect to WiFi
+    while (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000) != 0) {
+        printf("Failed to connect to WiFi... retrying\n");
+        sleep_ms(1000);
     }
+    printf("Connected to WiFi\n");
 
-    while(1){
-        uint32_t signal = multicore_fifo_pop_blocking();
-        if (signal == 1) {
-            // Log data
-            if (buffer_0_ready) {
-                process_adc_data(adc_buffer_0, BUFFER_SIZE);
-                buffer_0_ready = false;  // Reset the flag after processing
-            }
-
-            if (buffer_1_ready) {
-                process_adc_data(adc_buffer_1, BUFFER_SIZE);
-                buffer_1_ready = false;  // Reset the flag after processing
+    // Initialize web server
+    httpd_init();
+    http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers)/sizeof(tCGI));
+    
+    // Continuous polling send data to server
+    while (true) {
+        
+        sleep_ms(10);  // server processing delay
+        
+        // Check for new data from Core 0
+        if (multicore_fifo_rvalid()) {
+            uint32_t signal = multicore_fifo_pop_blocking();
+            if (signal == 1) {
+                // Update latest readings in critical section
+                critical_section_enter_blocking(&data_critsec);
+                latest_readings = *((data*)signal);
+                critical_section_exit(&data_critsec);
             }
         }
-    }    
+    }
 }
